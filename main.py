@@ -6,6 +6,7 @@ import requests
 from datetime import datetime
 from dotenv import load_dotenv
 import pytz
+
 from logging_service import setup_logging
 from zoho_crm import ZohoCRMService
 from email_handler import EmailHandler
@@ -100,8 +101,9 @@ def main_loop():
                 logger.error(f"Error fetching deals: {e_deals}", exc_info=True)
                 deals_to_send = []
 
+            # 1) Send feedback emails for deals with 'Feedback_Email' = 'Senden'
             for deal in deals_to_send:
-                deal_id = deal["id"]
+                deal_id  = deal["id"]
                 anrede   = deal.get("Anrede", "")
                 vorname  = deal.get("Vorname", "")
                 nachname = deal.get("Nachname", "")
@@ -122,6 +124,7 @@ Status: {stage}
 Leistung: {service}
 Extra Info: {desc}
 """
+
                 email_body = compose_assistant.generate_email(user_message)
                 subject_line = f"Feedback erbeten, {vorname} {nachname}"
 
@@ -131,9 +134,11 @@ Extra Info: {desc}
                 associate_email_with_deal(zoho, deal_id, SENDER_EMAIL, recipient, subject_line, email_body, sent=True)
                 logger.info(f"Email linked to deal {deal_id} and sent to {recipient}")
 
+                # Update CRM to mark email as sent
                 zoho.update_record(module_name, deal_id, {"Feedback_Email": "Gesendet"})
                 logger.info(f"Deal {deal_id} updated to 'Gesendet'")
 
+            # 2) Check incoming replies
             logger.info("Checking inbox for new emails...")
             new_emails = email_handler.check_incoming_emails()
             logger.info(f"Fetched {len(new_emails)} new emails to analyze.")
@@ -152,17 +157,30 @@ Extra Info: {desc}
                 matched_deal = matching_deals[0]
                 deal_id = matched_deal["id"]
 
+                # Analyze the reply with the updated AnalyzeAssistant
                 analysis_result = analyze_assistant.analyze_reply(body_text)
                 logger.info(f"For {sender_email}, analysis => {analysis_result}")
 
+                # Extract 'Feedback:' from the structured output
                 feedback_value = "Andere"
-                match = re.search(r"Feedback:\s*([^\n]+)", analysis_result)
-                if match:
-                    feedback_value = match.group(1).strip()
+                match_feedback = re.search(r"Feedback:\s*([^\n]+)", analysis_result)
+                if match_feedback:
+                    feedback_value = match_feedback.group(1).strip()
 
-                zoho.update_record(module_name, deal_id, {"Grund": feedback_value})
-                logger.info(f"Deal {deal_id} 'Grund' => {feedback_value}")
+                # Extract 'Zusammenfassung:' from the structured output
+                summary_value = ""
+                match_summary = re.search(r"Zusammenfassung:\s*(.*?)(?=\n[A-Z][a-z]*:|$)", analysis_result, re.DOTALL)
+                if match_summary:
+                    summary_value = match_summary.group(1).strip()
 
+                # Update CRM with both 'Grund' and the new multiline field 'Zusammenfassung_des_Feedbacks'
+                zoho.update_record(module_name, deal_id, {
+                    "Grund": feedback_value,
+                    "Zusammenfassung_des_Feedbacks": summary_value
+                })
+                logger.info(f"Deal {deal_id} updated => Grund: {feedback_value}, Zusammenfassung_des_Feedbacks: {summary_value}")
+
+                # Associate the *incoming* email with the deal
                 associate_email_with_deal(zoho, deal_id, sender_email, SENDER_EMAIL, "Re: Feedback", body_text, sent=False)
 
         except Exception as e_main:
