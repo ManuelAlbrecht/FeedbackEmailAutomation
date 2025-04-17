@@ -1,3 +1,4 @@
+# main.py
 import os
 import time
 import re
@@ -15,13 +16,11 @@ from ai_processor import ComposeAssistant, AnalyzeAssistant
 load_dotenv()
 logger = setup_logging()
 
-
-# Zoho
+# ──────────── ENV ────────────
 ZOHO_CLIENT_ID     = os.getenv("ZOHO_CLIENT_ID")
 ZOHO_CLIENT_SECRET = os.getenv("ZOHO_CLIENT_SECRET")
 ZOHO_REFRESH_TOKEN = os.getenv("ZOHO_REFRESH_TOKEN")
 
-# Email
 SMTP_SERVER  = os.getenv("SMTP_SERVER")
 SMTP_PORT    = int(os.getenv("SMTP_PORT", 465))
 IMAP_SERVER  = os.getenv("IMAP_SERVER")
@@ -30,7 +29,7 @@ EMAIL_USER   = os.getenv("EMAIL_USERNAME")
 EMAIL_PASS   = os.getenv("EMAIL_PASSWORD")
 SENDER_EMAIL = os.getenv("SENDER_EMAIL")
 
-
+# ──────────── HELPERS ────────────
 def associate_email_with_deal(zoho, deal_id, from_email, to_email, subject, content, sent=True):
     url = f"https://www.zohoapis.eu/crm/v3/Deals/{deal_id}/actions/associate_email"
     headers = {
@@ -38,15 +37,15 @@ def associate_email_with_deal(zoho, deal_id, from_email, to_email, subject, cont
         "Content-Type": "application/json"
     }
 
-    msg_id = f"<{uuid.uuid4()}@erdbaron.com>"
     berlin = pytz.timezone("Europe/Berlin")
     now_iso = datetime.now(berlin).replace(microsecond=0).isoformat()
+    msg_id  = f"<{uuid.uuid4()}@erdbaron.com>"
 
     payload = {
         "Emails": [
             {
                 "from": {"email": from_email},
-                "to": [{"email": to_email}],
+                "to":   [{"email": to_email}],
                 "subject": subject,
                 "content": content,
                 "date_time": now_iso,
@@ -57,26 +56,18 @@ def associate_email_with_deal(zoho, deal_id, from_email, to_email, subject, cont
     }
 
     r = requests.post(url, headers=headers, json=payload)
-    logger.info(f"Associate email response: {r.status_code}, {r.text}")
-    if r.status_code == 401:
-        logger.warning("Access token expired, refreshing and retrying...")
+    if r.status_code == 401:  # refresh token if needed
         zoho.access_token = zoho._get_access_token()
         headers["Authorization"] = f"Zoho-oauthtoken {zoho.access_token}"
         r = requests.post(url, headers=headers, json=payload)
-        logger.info(f"Second attempt response: {r.status_code}, {r.text}")
-
     r.raise_for_status()
+    logger.info(f"Associate email response: {r.status_code}")
 
-
+# ──────────── MAIN LOOP ────────────
 def main_loop():
-    logger.info("Initializing services...")
+    logger.info("Initializing services")
 
-    zoho = ZohoCRMService(
-        client_id=ZOHO_CLIENT_ID,
-        client_secret=ZOHO_CLIENT_SECRET,
-        refresh_token=ZOHO_REFRESH_TOKEN
-    )
-
+    zoho = ZohoCRMService(ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, ZOHO_REFRESH_TOKEN)
     email_handler = EmailHandler(
         smtp_server=SMTP_SERVER,
         smtp_port=SMTP_PORT,
@@ -86,23 +77,16 @@ def main_loop():
         password=EMAIL_PASS,
         sender=SENDER_EMAIL
     )
+    compose_assistant = ComposeAssistant()
+    analyze_assistant = AnalyzeAssistant()
+    module_name = "Deals"
 
-    compose_assistant  = ComposeAssistant()
-    analyze_assistant  = AnalyzeAssistant()
-    module_name        = "Deals"
-
-    logger.info("Starting feedback email loop...")
+    logger.info("Automation running ...")
 
     while True:
         try:
-            
-            logger.info("Checking deals that need an email...")
-            try:
-                deals_to_send = zoho.search_records(module_name, "(Feedback_Email:equals:Senden)")
-            except Exception as e_deals:
-                logger.error(f"Error fetching deals: {e_deals}", exc_info=True)
-                deals_to_send = []
-
+            # ── SEND FEEDBACK EMAILS ──
+            deals_to_send = zoho.search_records(module_name, "(Feedback_Email:equals:Senden)")
             for deal in deals_to_send:
                 deal_id   = deal["id"]
                 anrede    = deal.get("Anrede", "")
@@ -111,20 +95,17 @@ def main_loop():
                 stage     = deal.get("Stage", "")
                 service   = deal.get("Leistung_Lieferung", "")
                 desc      = deal.get("Projektmanager_Feedback", "")
-
-                # New: pull & format Created_Time ➜ Datum der Anfrage
-                created_time_raw = deal.get("Created_Time", "")
+                created_raw = deal.get("Created_Time", "")
                 try:
-                    created_date = datetime.fromisoformat(created_time_raw).strftime("%d.%m.%Y")
+                    created_date = datetime.fromisoformat(created_raw).strftime("%d.%m.%Y")
                 except Exception:
                     created_date = ""
-
                 recipient = deal.get("E_Mail", "")
                 if not recipient:
-                    logger.warning(f"Deal {deal_id}: no E_Mail, skipping.")
+                    logger.warning(f"Deal {deal_id}: no email, skipped")
                     continue
 
-                # Build prompt for Compose Assistant
+                # prompt for Compose Assistant
                 user_message = f"""
 Anrede: {anrede}
 Vorname: {vorname}
@@ -135,81 +116,65 @@ Datum der Anfrage: {created_date}
 Extra Info: {desc}
 """
 
-                email_body  = compose_assistant.generate_email(user_message)
-                subject_line = f"Feedback erbeten, {vorname} {nachname}"
+                raw_response = compose_assistant.generate_email(user_message).lstrip()
 
+                # split subject + body
+                first_line, *rest = raw_response.splitlines()
+                m_sub = re.match(r"^(?:Betreff|Subject):\s*(.*)", first_line, re.IGNORECASE)
+                if m_sub:
+                    subject_line = m_sub.group(1).strip() or f"Feedback erbeten, {vorname} {nachname}"
+                    email_body   = "\n".join(rest).lstrip()
+                else:
+                    subject_line = f"Feedback erbeten, {vorname} {nachname}"
+                    email_body   = raw_response
+
+                # send email
                 email_handler.send_email(recipient, subject_line, email_body)
-                logger.info(f"Email sent to {recipient}")
+                logger.info(f"Sent to {recipient} | Subject: {subject_line}")
 
                 associate_email_with_deal(
                     zoho, deal_id, SENDER_EMAIL, recipient, subject_line, email_body, sent=True
                 )
-
                 zoho.update_record(module_name, deal_id, {"Feedback_Email": "Gesendet"})
-                logger.info(f"Deal {deal_id} updated to 'Gesendet'")
 
-            # ── 2) CHECK INCOMING REPLIES ───────────────────────── #
-            logger.info("Checking inbox for new emails...")
+            # ── CHECK INCOMING REPLIES ──
             new_emails = email_handler.check_incoming_emails()
-            logger.info(f"Fetched {len(new_emails)} new emails to analyze.")
-
             for sender_email, body_text in new_emails:
-                try:
-                    matching_deals = zoho.search_records(module_name, f"(E_Mail:equals:{sender_email})")
-                except Exception as e_search:
-                    logger.error(f"Error searching deals for {sender_email}: {e_search}", exc_info=True)
-                    matching_deals = []
-
-                if not matching_deals:
-                    logger.info(f"No deals found for {sender_email}, skipping.")
+                deals = zoho.search_records(module_name, f"(E_Mail:equals:{sender_email})")
+                if not deals:
+                    logger.info(f"No deal for {sender_email}")
                     continue
+                deal_id = deals[0]["id"]
 
-                deal_id = matching_deals[0]["id"]
-
-                # Analyze reply
-                analysis_result = analyze_assistant.analyze_reply(body_text)
-                logger.info(f"For {sender_email}, analysis => {analysis_result}")
-
-                # Extract Feedback
-                feedback_value = "Andere"
-                m_feedback = re.search(r"Feedback:\s*([^\n]+)", analysis_result)
-                if m_feedback:
-                    feedback_value = m_feedback.group(1).strip()
-
-                # Extract Zusammenfassung (may span multiple lines)
-                summary_value = ""
-                m_summary = re.search(
+                analysis = analyze_assistant.analyze_reply(body_text)
+                m_feed = re.search(r"Feedback:\s*([^\n]+)", analysis)
+                feedback_val = m_feed.group(1).strip() if m_feed else "Andere"
+                m_sum = re.search(
                     r"Zusammenfassung:\s*(.*?)(?=\n[A-Z][a-zA-ZäöüÄÖÜß]+:|$)",
-                    analysis_result,
+                    analysis,
                     re.DOTALL
                 )
-                if m_summary:
-                    summary_value = m_summary.group(1).strip()
+                summary_val = m_sum.group(1).strip() if m_sum else ""
 
-                # Update CRM
                 zoho.update_record(
                     module_name,
                     deal_id,
                     {
-                        "Grund": feedback_value,
-                        "Zusammenfassung_des_Feedbacks": summary_value
+                        "Grund": feedback_val,
+                        "Zusammenfassung_des_Feedbacks": summary_val
                     }
                 )
-                logger.info(
-                    f"Deal {deal_id} updated => Grund: {feedback_value}, "
-                    f"Zusammenfassung_des_Feedbacks: {summary_value}"
-                )
+                logger.info(f"Deal {deal_id} updated (Grund={feedback_val})")
 
-                # Associate incoming email
                 associate_email_with_deal(
                     zoho, deal_id, sender_email, SENDER_EMAIL, "Re: Feedback", body_text, sent=False
                 )
 
-        except Exception as e_main:
-            logger.error(f"Error in main loop: {e_main}", exc_info=True)
+        except Exception as e:
+            logger.error(f"Loop error: {e}", exc_info=True)
 
-        logger.info("Sleeping for 60 seconds...")
         time.sleep(60)
 
+# ─────────────────────────────
 if __name__ == "__main__":
     main_loop()
